@@ -2,9 +2,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const [mode, configPath, backupPath] = process.argv.slice(2);
+// Backup these keys so Restore can put them back. Do NOT force dark —
+// Dream Skin CSS auto-adapts to light/dark via data-dream-shell.
 const settings = new Map([
-  ["appearanceTheme", 'appearanceTheme = "dark"'],
-  ["appearanceDarkCodeThemeId", 'appearanceDarkCodeThemeId = "codex"'],
+  ["appearanceTheme", null],
+  ["appearanceDarkCodeThemeId", null],
 ]);
 
 if (!["install", "restore"].includes(mode) || !configPath || !backupPath) {
@@ -57,7 +59,7 @@ if (mode === "install") {
   } catch {
     const values = {};
     for (const key of settings.keys()) {
-      const match = new RegExp(`^${key}\\s*=.*$`, "m").exec(section.body);
+      const match = new RegExp(`^${key.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\s*=.*$`, "m").exec(section.body);
       values[key] = match ? match[0] : null;
     }
     const backup = {
@@ -71,11 +73,19 @@ if (mode === "install") {
     await atomicWrite(backupPath, `${JSON.stringify(backup, null, 2)}\n`, 0o600);
   }
 
+  // Only apply non-null settings. null means "backup only / leave user's appearance alone".
   let body = section.body;
-  for (const [key, line] of settings) body = replaceSetting(body, key, line);
-  const updated = content.slice(0, section.bodyStart) + body + content.slice(section.bodyEnd);
-  await atomicWrite(configPath, updated, originalStat.mode & 0o777);
-  console.log("Saved the original base-theme keys and selected the dark Codex base theme.");
+  let changed = false;
+  for (const [key, line] of settings) {
+    if (line === null) continue;
+    body = replaceSetting(body, key, line);
+    changed = true;
+  }
+  if (changed) {
+    const updated = content.slice(0, section.bodyStart) + body + content.slice(section.bodyEnd);
+    await atomicWrite(configPath, updated, originalStat.mode & 0o777);
+  }
+  console.log("Saved base-theme backup; left Codex appearanceTheme unchanged (skin auto-adapts light/dark).");
 } else {
   let backup;
   try {

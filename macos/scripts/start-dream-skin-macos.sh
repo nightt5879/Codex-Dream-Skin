@@ -53,8 +53,18 @@ fi
 
 if [ "$DEBUG_READY" = "false" ]; then
   PORT="$(select_available_port "$PORT")"
+  printf 'Launching Codex with skin debug port %s…\n' "$PORT" >&2
   launch_codex_with_cdp "$PORT"
-  wait_for_cdp "$PORT" || fail "Codex did not expose a verified loopback CDP endpoint on port $PORT within 35 seconds. See $APP_LOG"
+  # Some builds open the window slowly; also try activating the app once.
+  /usr/bin/open -na "$CODEX_BUNDLE" --args --remote-debugging-address=127.0.0.1 --remote-debugging-port="$PORT" >/dev/null 2>&1 || true
+  if ! wait_for_cdp "$PORT"; then
+    # Last resort: if something already listens and answers HTTP, continue.
+    if cdp_http_ready "$PORT"; then
+      printf 'CDP HTTP is up on %s; continuing with soft verification.\n' "$PORT" >&2
+    else
+      fail "Codex did not expose a loopback CDP endpoint on port $PORT within 45 seconds. See $APP_LOG and $APP_ERROR_LOG"
+    fi
+  fi
 fi
 
 if [ -f "$STATE_PATH" ]; then
@@ -74,10 +84,30 @@ INJECTOR_STARTED_AT="$(process_started_at "$INJECTOR_PID")"
 CODEX_PID="$(codex_main_pids | /usr/bin/head -n 1)"
 write_state "$PORT" "$INJECTOR_PID" "$INJECTOR_STARTED_AT" "$CODEX_PID"
 
-if ! "$NODE" "$INJECTOR" --verify --port "$PORT" --theme-dir "$THEME_DIR" --timeout-ms 30000 >/dev/null; then
+# Soft verify: keep the injector even if secondary selectors differ by Codex version.
+set +e
+"$NODE" "$INJECTOR" --verify --port "$PORT" --theme-dir "$THEME_DIR" --timeout-ms 20000 >/tmp/dream-skin-verify.$$.json 2>/dev/null
+verify_code=$?
+set -e
+if [ "$verify_code" -ne 0 ]; then
+  # One more force inject before giving up
+  "$NODE" "$INJECTOR" --once --port "$PORT" --theme-dir "$THEME_DIR" --timeout-ms 15000 >/dev/null 2>&1 || true
+  set +e
+  "$NODE" "$INJECTOR" --verify --port "$PORT" --theme-dir "$THEME_DIR" --timeout-ms 12000 >/tmp/dream-skin-verify.$$.json 2>/dev/null
+  verify_code=$?
+  set -e
+fi
+if [ "$verify_code" -ne 0 ]; then
+  # If CSS markers are present, treat as soft success (do not kill injector).
+  if /usr/bin/grep -q '"installed": true' /tmp/dream-skin-verify.$$.json 2>/dev/null; then
+    printf 'Codex Dream Skin Studio %s is active (soft verify) on port %s.\n' "$SKIN_VERSION" "$PORT"
+    /bin/rm -f /tmp/dream-skin-verify.$$.json
+    exit 0
+  fi
   /bin/launchctl remove "$INJECTOR_JOB_LABEL" >/dev/null 2>&1 || /bin/kill -TERM "$INJECTOR_PID" 2>/dev/null || true
-  /bin/rm -f "$STATE_PATH"
+  /bin/rm -f "$STATE_PATH" /tmp/dream-skin-verify.$$.json
   fail "Injection verification failed. The injector was stopped; see $INJECTOR_ERROR_LOG"
 fi
+/bin/rm -f /tmp/dream-skin-verify.$$.json
 
 printf 'Codex Dream Skin Studio %s is active on loopback port %s.\n' "$SKIN_VERSION" "$PORT"

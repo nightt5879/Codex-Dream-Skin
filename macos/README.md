@@ -31,6 +31,10 @@ This project injects through **local loopback CDP**. It does **not** modify the 
 #    Codex Dream Skin - Customize.command
 #    Codex Dream Skin - Verify.command
 #    Codex Dream Skin - Restore.command
+
+# 5) Optional: menu bar (SwiftBar) — apply / pause / change image
+./Install\ Menu\ Bar.command
+# Look for 🎨 Skin in the top-right menu bar
 ```
 
 Install location after step 2:

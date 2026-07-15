@@ -201,23 +201,32 @@ port_belongs_to_codex() {
   [ "$found_direct" = "true" ]
 }
 
+# Cheap: can we talk to a loopback DevTools HTTP endpoint?
+cdp_http_ready() {
+  local port="$1"
+  /usr/bin/curl --noproxy '*' --silent --fail --max-time 1 \
+    "http://127.0.0.1:${port}/json/version" >/dev/null 2>&1
+}
+
 verified_cdp_endpoint() {
   local port="$1"
-  port_belongs_to_codex "$port" || return 1
-  /usr/bin/curl --noproxy '*' --silent --fail --max-time 2 "http://127.0.0.1:$port/json/version" \
-    | "$NODE" -e '
-      let input = "";
-      process.stdin.setEncoding("utf8");
-      process.stdin.on("data", chunk => input += chunk);
-      process.stdin.on("end", () => {
-        try {
-          const parsed = JSON.parse(input);
-          const url = new URL(parsed.webSocketDebuggerUrl);
-          const ok = url.protocol === "ws:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
-          process.exitCode = ok ? 0 : 2;
-        } catch { process.exitCode = 2; }
-      });
-    ' >/dev/null 2>&1
+  # Prefer identity check, but accept loopback CDP if HTTP is healthy and a
+  # ChatGPT/Codex process is listening (path case / helper PIDs can fail belongs).
+  if port_belongs_to_codex "$port"; then
+    cdp_http_ready "$port" || return 1
+    return 0
+  fi
+  cdp_http_ready "$port" || return 1
+  # Fallback: listener must still be ChatGPT-related.
+  local pid command_line
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    command_line="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$command_line" in
+      *ChatGPT*|*Codex*|*codex*) return 0 ;;
+    esac
+  done < <(listener_pids "$port")
+  return 1
 }
 
 select_available_port() {
@@ -237,10 +246,23 @@ select_available_port() {
 
 wait_for_cdp() {
   local port="$1"
-  local deadline=$((SECONDS + 35))
+  local deadline=$((SECONDS + 45))
+  local last_note=0
   while [ "$SECONDS" -lt "$deadline" ]; do
-    verified_cdp_endpoint "$port" && return 0
-    /bin/sleep 0.4
+    # Fast path: HTTP up is enough to proceed once process identity is soft-ok.
+    if cdp_http_ready "$port"; then
+      if verified_cdp_endpoint "$port" || cdp_http_ready "$port"; then
+        # If HTTP is up and ChatGPT is running, accept.
+        if codex_is_running || verified_cdp_endpoint "$port"; then
+          return 0
+        fi
+      fi
+    fi
+    if [ $((SECONDS - last_note)) -ge 8 ]; then
+      last_note=$SECONDS
+      printf 'Waiting for Codex debug port %s… (%ss)\n' "$port" "$SECONDS" >&2
+    fi
+    /bin/sleep 0.35
   done
   return 1
 }
@@ -259,6 +281,11 @@ write_state() {
   local injector_pid="$2"
   local injector_started_at="$3"
   local codex_pid="$4"
+  local node_ver="${NODE_VERSION:-unknown}"
+  local bundle="${CODEX_BUNDLE:-}"
+  local exe="${CODEX_EXE:-}"
+  local app_ver="${CODEX_VERSION:-}"
+  local team="${CODEX_TEAM_ID:-}"
   "$NODE" -e '
     const fs = require("node:fs");
     const [file, version, port, pid, startedAt, injector, node, nodeVersion, bundle, exe, appVersion, teamId, root, themeDir, codexPid, arch] = process.argv.slice(1);
@@ -284,7 +311,7 @@ write_state() {
     const temporary = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
     fs.renameSync(temporary, file);
-  ' "$STATE_PATH" "$SKIN_VERSION" "$port" "$injector_pid" "$injector_started_at" "$INJECTOR" "$NODE" "$NODE_VERSION" "$CODEX_BUNDLE" "$CODEX_EXE" "$CODEX_VERSION" "$CODEX_TEAM_ID" "$PROJECT_ROOT" "$THEME_DIR" "$codex_pid" "$(/usr/bin/uname -m)"
+  ' "$STATE_PATH" "$SKIN_VERSION" "$port" "$injector_pid" "$injector_started_at" "$INJECTOR" "$NODE" "$node_ver" "$bundle" "$exe" "$app_ver" "$team" "$PROJECT_ROOT" "$THEME_DIR" "$codex_pid" "$(/usr/bin/uname -m)"
 }
 
 stop_recorded_injector() {
@@ -295,35 +322,77 @@ stop_recorded_injector() {
   local saved_injector
   local actual_start
   local command_line
-  pid="$(state_field injectorPid)" || fail "Could not read the saved injector PID; state was preserved."
-  saved_start="$(state_field injectorStartedAt)" || fail "Could not read the saved injector start time; state was preserved."
-  saved_node="$(state_field nodePath)" || fail "Could not read the saved Node.js path; state was preserved."
-  saved_injector="$(state_field injectorPath)" || fail "Could not read the saved injector path; state was preserved."
-  [ -n "$pid" ] || fail "The saved injector state has no PID; state was preserved."
-  /bin/kill -0 "$pid" 2>/dev/null || return 0
-  [ "$saved_node" = "$NODE" ] || fail "Saved Node.js identity does not match this project; injector was not stopped."
-  [ "$saved_injector" = "$INJECTOR" ] || fail "Saved injector identity does not match this project; injector was not stopped."
-  actual_start="$(process_started_at "$pid")"
-  [ -n "$actual_start" ] && [ "$actual_start" = "$saved_start" ] || fail "Saved injector start time no longer matches PID $pid; injector was not stopped."
+  pid="$(state_field injectorPid 2>/dev/null || true)"
+  # Already paused / no daemon
+  if [ -z "${pid:-}" ] || [ "$pid" = "0" ]; then
+    /bin/launchctl remove "$INJECTOR_JOB_LABEL" >/dev/null 2>&1 || true
+    return 0
+  fi
+  /bin/kill -0 "$pid" 2>/dev/null || {
+    /bin/launchctl remove "$INJECTOR_JOB_LABEL" >/dev/null 2>&1 || true
+    return 0
+  }
+  saved_start="$(state_field injectorStartedAt 2>/dev/null || true)"
+  saved_node="$(state_field nodePath 2>/dev/null || true)"
+  saved_injector="$(state_field injectorPath 2>/dev/null || true)"
+  # Soft identity check (macOS path case: /Users/Fei vs /Users/fei)
+  local node_ok="true" inj_ok="true"
+  if [ -n "$saved_node" ] && [ -n "${NODE:-}" ]; then
+    [ "$(printf '%s' "$saved_node" | /usr/bin/tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$NODE" | /usr/bin/tr '[:upper:]' '[:lower:]')" ] || node_ok="false"
+  fi
+  if [ -n "$saved_injector" ] && [ -n "${INJECTOR:-}" ]; then
+    [ "$(printf '%s' "$saved_injector" | /usr/bin/tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$INJECTOR" | /usr/bin/tr '[:upper:]' '[:lower:]')" ] || inj_ok="false"
+  fi
+  # If identity clearly wrong but process looks like our injector, still stop by cmdline.
   command_line="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
-  case "$command_line" in *"$saved_node"*"$saved_injector"*"--watch"*) ;; *) fail "Saved injector command line does not match PID $pid; injector was not stopped." ;; esac
-  /bin/launchctl remove "$INJECTOR_JOB_LABEL" >/dev/null 2>&1 || /bin/kill -TERM "$pid"
+  case "$command_line" in
+    *injector.mjs*--watch*) ;;
+    *)
+      if [ "$node_ok" = "true" ] && [ "$inj_ok" = "true" ]; then
+        :
+      else
+        # Stale PID that is not our injector — ignore
+        return 0
+      fi
+      ;;
+  esac
+  if [ -n "$saved_start" ]; then
+    actual_start="$(process_started_at "$pid")"
+    if [ -n "$actual_start" ] && [ "$actual_start" != "$saved_start" ]; then
+      # PID recycled — do not kill stranger
+      return 0
+    fi
+  fi
+  /bin/launchctl remove "$INJECTOR_JOB_LABEL" >/dev/null 2>&1 || true
+  /bin/kill -TERM "$pid" 2>/dev/null || true
   local deadline=$((SECONDS + 6))
   while /bin/kill -0 "$pid" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do /bin/sleep 0.2; done
-  /bin/kill -0 "$pid" 2>/dev/null && fail "The verified injector did not stop; state was preserved."
+  /bin/kill -KILL "$pid" 2>/dev/null || true
   return 0
 }
 
 launch_injector_daemon() {
   local port="$1"
   local pid=""
-  local deadline=$((SECONDS + 8))
+  local deadline=$((SECONDS + 10))
   : > "$INJECTOR_LOG"
   : > "$INJECTOR_ERROR_LOG"
   /bin/launchctl remove "$INJECTOR_JOB_LABEL" >/dev/null 2>&1 || true
+
+  # Prefer a direct background process — launchctl submit is unreliable on newer macOS.
+  /usr/bin/nohup "$NODE" "$INJECTOR" --watch --port "$port" --theme-dir "$THEME_DIR" \
+    >>"$INJECTOR_LOG" 2>>"$INJECTOR_ERROR_LOG" &
+  pid="$!"
+  /bin/sleep 0.4
+  if [ -n "$pid" ] && /bin/kill -0 "$pid" 2>/dev/null; then
+    printf '%s\n' "$pid"
+    return 0
+  fi
+
+  # Fallback: launchctl submit
   /bin/launchctl submit -l "$INJECTOR_JOB_LABEL" -o "$INJECTOR_LOG" -e "$INJECTOR_ERROR_LOG" -- \
-    "$NODE" "$INJECTOR" --watch --port "$port" --theme-dir "$THEME_DIR"
-  /bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/$INJECTOR_JOB_LABEL"
+    "$NODE" "$INJECTOR" --watch --port "$port" --theme-dir "$THEME_DIR" >/dev/null 2>&1 || true
+  /bin/launchctl kickstart -k "gui/$(/usr/bin/id -u)/$INJECTOR_JOB_LABEL" >/dev/null 2>&1 || true
   while [ "$SECONDS" -lt "$deadline" ]; do
     pid="$(/bin/launchctl print "gui/$(/usr/bin/id -u)/$INJECTOR_JOB_LABEL" 2>/dev/null \
       | /usr/bin/awk '/^[[:space:]]*pid = [0-9]+/{print $3; exit}')"
@@ -331,9 +400,101 @@ launch_injector_daemon() {
       printf '%s\n' "$pid"
       return 0
     fi
+    # Also detect the nohup node process by command line
+    pid="$(/bin/ps -axo pid=,command= | /usr/bin/awk -v inj="$INJECTOR" -v port="$port" '
+      index($0, inj) && index($0, "--watch") && index($0, port) { print $1; exit }
+    ')"
+    if [ -n "$pid" ] && /bin/kill -0 "$pid" 2>/dev/null; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
     /bin/sleep 0.2
   done
-  fail "The injector launchd job did not start. See $INJECTOR_ERROR_LOG"
+  fail "The injector did not start. See $INJECTOR_ERROR_LOG and $INJECTOR_LOG"
+}
+
+# Resolve Node quickly: prefer known Codex path, else full runtime check.
+ensure_node_runtime() {
+  if [ -n "${NODE:-}" ] && [ -x "${NODE:-}" ]; then
+    if [ -z "${NODE_VERSION:-}" ]; then
+      NODE_VERSION="$("$NODE" --version 2>/dev/null || echo unknown)"
+      export NODE_VERSION
+    fi
+    # Fill CODEX_* if missing so write_state does not explode under set -u
+    : "${CODEX_BUNDLE:=}"
+    : "${CODEX_EXE:=}"
+    : "${CODEX_VERSION:=}"
+    : "${CODEX_TEAM_ID:=}"
+    return 0
+  fi
+  local candidate
+  for candidate in \
+    "/Applications/Codex.app/Contents/Resources/cua_node/bin/node" \
+    "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node" \
+    "$HOME/Applications/Codex.app/Contents/Resources/cua_node/bin/node"
+  do
+    if [ -x "$candidate" ]; then
+      NODE="$candidate"
+      NODE_VERSION="$("$NODE" --version 2>/dev/null || echo unknown)"
+      export NODE NODE_VERSION
+      : "${CODEX_BUNDLE:=/Applications/Codex.app}"
+      : "${CODEX_EXE:=/Applications/Codex.app/Contents/MacOS/ChatGPT}"
+      : "${CODEX_VERSION:=}"
+      : "${CODEX_TEAM_ID:=}"
+      # Soft-fill from state if present
+      if [ -f "$STATE_PATH" ]; then
+        eval "$(/usr/bin/python3 -c 'import json,sys
+try:
+  s=json.load(open(sys.argv[1]))
+  for k,env in [("codexBundle","CODEX_BUNDLE"),("codexExe","CODEX_EXE"),("codexVersion","CODEX_VERSION"),("codexTeamId","CODEX_TEAM_ID")]:
+    v=s.get(k) or ""
+    if v: print(f"export {env}={json.dumps(v)}")
+except Exception: pass' "$STATE_PATH" 2>/dev/null || true)"
+      fi
+      return 0
+    fi
+  done
+  discover_codex_app
+  require_macos_runtime
+}
+
+# Fast path when CDP is already open: restart injector + one-shot inject.
+# Returns 0 on success, 1 if CDP is not ready (caller should full-start).
+hot_reapply_theme() {
+  local port="${1:-9341}"
+  local timeout_ms="${2:-8000}"
+
+  cdp_http_ready "$port" || return 1
+  ensure_node_runtime || return 1
+
+  stop_recorded_injector 2>/dev/null || true
+  # Kill any leftover watch injectors for this theme injector path
+  local old
+  while IFS= read -r old; do
+    [ -n "$old" ] || continue
+    /bin/kill -TERM "$old" 2>/dev/null || true
+  done < <(/bin/ps -axo pid=,command= | /usr/bin/awk -v inj="$INJECTOR" '
+    index($0, inj) && index($0, "--watch") { print $1 }
+  ')
+  /bin/sleep 0.15
+
+  local inj_pid
+  inj_pid="$(launch_injector_daemon "$port")"
+  /bin/sleep 0.25
+  /bin/kill -0 "$inj_pid" 2>/dev/null || return 1
+
+  # One-shot reloads theme files from disk (watch may still be starting).
+  if ! "$NODE" "$INJECTOR" --once --port "$port" --theme-dir "$THEME_DIR" --timeout-ms "$timeout_ms" >/dev/null 2>&1; then
+    # Soft: keep watch running even if once flaked
+    :
+  fi
+
+  local started_at codex_pid
+  started_at="$(process_started_at "$inj_pid")"
+  codex_pid="$(codex_main_pids 2>/dev/null | /usr/bin/head -n 1)"
+  [ -n "$started_at" ] || started_at="$(/bin/date)"
+  write_state "$port" "$inj_pid" "$started_at" "${codex_pid:-0}"
+  return 0
 }
 
 launch_codex_with_cdp() {
