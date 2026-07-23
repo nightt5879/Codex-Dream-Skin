@@ -1165,6 +1165,10 @@ try {
   if (-not $commonSource.Contains('State was preserved.')) {
     throw 'Mismatched live injector identity does not fail closed with preserved state.'
   }
+  if (-not $commonSource.Contains('Stop-Process -InputObject $process') -or
+    -not $commonSource.Contains('WaitForExit(15000)')) {
+    throw 'Recorded injector cleanup no longer waits on the validated process handle.'
+  }
   $traySource = Read-DreamSkinUtf8File -Path (Join-Path $Root 'scripts\tray-dream-skin.ps1')
   foreach ($requiredRecoveryBehavior in @(
     'Get-DreamSkinRecordedInjectorProcess',
@@ -1200,7 +1204,7 @@ try {
     function Get-DreamSkinRecordedInjectorProcess {
       param([AllowNull()][object]$State)
       if ($recoveryProbe.InjectorRunning) {
-        return [pscustomobject]@{ ProcessId = 42 }
+        return [System.Diagnostics.Process]::GetCurrentProcess()
       }
       return $null
     }
@@ -1273,9 +1277,10 @@ try {
       browserId = 'browser-recovery-test'
     }
     $recordedProcess = Get-DreamSkinRecordedInjectorProcess -State $fakeState
-    if ($null -eq $recordedProcess -or [int]$recordedProcess.ProcessId -ne $fakeInjector.Id) {
+    if ($null -eq $recordedProcess -or [int]$recordedProcess.Id -ne $fakeInjector.Id) {
       throw 'A live recorded injector did not pass exact process-identity validation.'
     }
+    $recordedProcess.Dispose()
     $mismatchedState = $fakeState.PSObject.Copy()
     $mismatchedState.browserId = 'browser-other'
     $mismatchRejected = $false
